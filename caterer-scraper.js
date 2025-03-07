@@ -225,22 +225,67 @@ function parseAddress(addressStr) {
 
 /**
  * Get additional details for a place using Place Details API
+ * Enhanced to fetch up to 20 reviews by making multiple requests with different sort orders
  */
 async function getPlaceDetails(placeId) {
   try {
     const { default: fetch } = await import('node-fetch');
     
-    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=formatted_phone_number,website,price_level,reviews&key=${CONFIG.googleApiKey}`;
+    // We'll make 4 separate requests to get up to 20 reviews (5 per request)
+    // Using different sort orders to try to get different reviews
+    const sortOptions = [
+      'most_relevant', // Default sort
+      'newest',       // Newest reviews
+      'highest',      // Highest rating first
+      'lowest'        // Lowest rating first
+    ];
     
-    const response = await fetch(url);
-    const data = await response.json();
+    let allReviews = [];
+    let details = null;
     
-    if (data.status !== 'OK') {
-      console.warn(`Warning: Could not get details for place ${placeId}: ${data.status}`);
-      return null;
+    for (const sortOption of sortOptions) {
+      const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=formatted_phone_number,website,price_level,reviews&reviewsort=${sortOption}&key=${CONFIG.googleApiKey}`;
+      
+      const response = await fetch(url);
+      const data = await response.json();
+      
+      if (data.status !== 'OK') {
+        console.warn(`Warning: Could not get details for place ${placeId} with sort ${sortOption}: ${data.status}`);
+        continue;
+      }
+      
+      // Store full details from the first request
+      if (!details) {
+        details = data.result;
+      }
+      
+      // Add new reviews that aren't duplicates
+      if (data.result.reviews && Array.isArray(data.result.reviews)) {
+        // Use a Set to track review IDs we've already seen
+        const existingReviewIds = new Set(allReviews.map(r => r.time + r.author_name));
+        
+        data.result.reviews.forEach(review => {
+          const reviewId = review.time + review.author_name;
+          if (!existingReviewIds.has(reviewId)) {
+            allReviews.push(review);
+            existingReviewIds.add(reviewId);
+          }
+        });
+      }
+      
+      // Respect API rate limits with a small delay
+      await new Promise(resolve => setTimeout(resolve, 300));
     }
     
-    return data.result;
+    // Cap at 20 reviews max and update the details object
+    if (allReviews.length > 0) {
+      allReviews = allReviews.slice(0, 20);
+      if (details) {
+        details.reviews = allReviews;
+      }
+    }
+    
+    return details;
   } catch (error) {
     console.error(`Error getting details for place ${placeId}:`, error);
     return null;
@@ -263,12 +308,20 @@ async function enrichCatererData(caterers) {
     const mapsUrl = `https://www.google.com/maps/place/?q=place_id:${caterers[i].placeId}`;
     
     if (details) {
+      // Check for wedding-related reviews
+      const weddingReviewInfo = checkForWeddingReviews(details.reviews);
+      
       enrichedCaterers.push({
         ...caterers[i],
         phoneNumber: details.formatted_phone_number || 'No phone number',
         website: details.website || 'No website',
         mapsUrl: mapsUrl,
-        priceLevel: details.price_level ? '$'.repeat(details.price_level) : 'Unknown'
+        priceLevel: details.price_level ? '$'.repeat(details.price_level) : 'Unknown',
+        // Add wedding review information
+        hasWeddingReviews: weddingReviewInfo.hasWeddingReviews,
+        weddingReviewCount: weddingReviewInfo.weddingReviewCount,
+        // Store the total number of reviews we found
+        reviewCount: details.reviews ? details.reviews.length : 0
       });
     } else {
       enrichedCaterers.push({
@@ -276,7 +329,10 @@ async function enrichCatererData(caterers) {
         phoneNumber: 'No phone number',
         website: 'No website',
         mapsUrl: mapsUrl,
-        priceLevel: 'Unknown'
+        priceLevel: 'Unknown',
+        hasWeddingReviews: false,
+        weddingReviewCount: 0,
+        reviewCount: 0
       });
     }
     
@@ -286,7 +342,6 @@ async function enrichCatererData(caterers) {
   
   return enrichedCaterers;
 }
-
 /**
  * Create a Google Sheet and add caterer information
  */
